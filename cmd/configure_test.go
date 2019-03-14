@@ -18,14 +18,6 @@ import (
 )
 
 func TestBareConfigure(t *testing.T) {
-	oldErr := Err
-	defer func() {
-		Err = oldErr
-	}()
-
-	var buf bytes.Buffer
-	Err = &buf
-
 	flags := pflag.NewFlagSet("fake", pflag.PanicOnError)
 	setupConfigureFlags(flags)
 
@@ -40,17 +32,16 @@ func TestBareConfigure(t *testing.T) {
 	}
 
 	err = runConfigure(cfg, flags)
-	assert.Regexp(t, "no token configured", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "no token configured", err.Error())
+	}
 }
 
 func TestConfigureShow(t *testing.T) {
-	oldErr := Err
-	defer func() {
-		Err = oldErr
-	}()
-
-	var buf bytes.Buffer
-	Err = &buf
+	co := newCapturedOutput()
+	co.newErr = &bytes.Buffer{}
+	co.override()
+	defer co.reset()
 
 	flags := pflag.NewFlagSet("fake", pflag.PanicOnError)
 	setupConfigureFlags(flags)
@@ -82,13 +73,17 @@ func TestConfigureShow(t *testing.T) {
 	assert.NotRegexp(t, "override.example", Err)
 
 	assert.Regexp(t, "configured-token", Err)
-	assert.NotRegexp(t, "token-overrid", Err)
+	assert.NotRegexp(t, "token-override", Err)
 
 	assert.Regexp(t, "configured-workspace", Err)
 	assert.NotRegexp(t, "workspace-override", Err)
 }
 
 func TestConfigureToken(t *testing.T) {
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
 	testCases := []struct {
 		desc       string
 		configured string
@@ -149,18 +144,7 @@ func TestConfigureToken(t *testing.T) {
 	ts := httptest.NewServer(endpoint)
 	defer ts.Close()
 
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
-
 	for _, tc := range testCases {
-		var buf bytes.Buffer
-		Err = &buf
-
 		flags := pflag.NewFlagSet("fake", pflag.PanicOnError)
 		setupConfigureFlags(flags)
 
@@ -185,6 +169,10 @@ func TestConfigureToken(t *testing.T) {
 }
 
 func TestConfigureAPIBaseURL(t *testing.T) {
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
 	endpoint := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/ping" {
 			w.WriteHeader(http.StatusNotFound)
@@ -237,18 +225,7 @@ func TestConfigureAPIBaseURL(t *testing.T) {
 		},
 	}
 
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
-
 	for _, tc := range testCases {
-		var buf bytes.Buffer
-		Err = &buf
-
 		flags := pflag.NewFlagSet("fake", pflag.PanicOnError)
 		setupConfigureFlags(flags)
 
@@ -273,11 +250,9 @@ func TestConfigureAPIBaseURL(t *testing.T) {
 }
 
 func TestConfigureWorkspace(t *testing.T) {
-	oldErr := Err
-	Err = ioutil.Discard
-	defer func() {
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
 
 	testCases := []struct {
 		desc       string
@@ -359,14 +334,9 @@ func TestConfigureWorkspace(t *testing.T) {
 }
 
 func TestConfigureDefaultWorkspaceWithoutClobbering(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
 
 	// Stub server to always be 200 OK
 	endpoint := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
@@ -398,19 +368,15 @@ func TestConfigureDefaultWorkspaceWithoutClobbering(t *testing.T) {
 	assert.NoError(t, err)
 
 	err = runConfigure(cfg, flags)
-	assert.Error(t, err)
-	assert.Regexp(t, "already something", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "already something", err.Error())
+	}
 }
 
 func TestConfigureExplicitWorkspaceWithoutClobberingNonDirectory(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
 
 	tmpDir, err := ioutil.TempDir("", "no-clobber")
 	defer os.RemoveAll(tmpDir)

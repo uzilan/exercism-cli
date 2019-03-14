@@ -78,14 +78,9 @@ func TestDownloadWithoutFlags(t *testing.T) {
 }
 
 func TestDownload(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
 
 	testCases := []struct {
 		requester   bool
@@ -149,7 +144,7 @@ func TestDownload(t *testing.T) {
 		assert.NoError(t, err)
 
 		assert.Equal(t, "bogus-track", metadata.Track)
-		assert.Equal(t, "bogus-exercise", metadata.Exercise)
+		assert.Equal(t, "bogus-exercise", metadata.ExerciseSlug)
 		assert.Equal(t, tc.requester, metadata.IsRequester)
 	}
 }

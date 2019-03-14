@@ -50,133 +50,36 @@ Download other people's solutions by providing the UUID.
 
 func runDownload(cfg config.Config, flags *pflag.FlagSet, args []string) error {
 	usrCfg := cfg.UserViperConfig
-	if usrCfg.GetString("token") == "" {
-		return fmt.Errorf(msgWelcomePleaseConfigure, config.SettingsURL(usrCfg.GetString("apibaseurl")), BinaryName)
-	}
-	if usrCfg.GetString("workspace") == "" || usrCfg.GetString("apibaseurl") == "" {
-		return fmt.Errorf(msgRerunConfigure, BinaryName)
-	}
-
-	uuid, err := flags.GetString("uuid")
-	if err != nil {
+	if err := validateUserConfig(usrCfg); err != nil {
 		return err
 	}
-	slug, err := flags.GetString("exercise")
-	if err != nil {
-		return err
-	}
-	if uuid != "" && slug != "" || uuid == slug {
-		return errors.New("need an --exercise name or a solution --uuid")
-	}
 
-	track, err := flags.GetString("track")
+	download, err := newDownload(flags, usrCfg)
 	if err != nil {
 		return err
 	}
 
-	team, err := flags.GetString("team")
-	if err != nil {
+	metadata := download.payload.metadata()
+	dir := metadata.Exercise(usrCfg.GetString("workspace")).MetadataDir()
+
+	if err := os.MkdirAll(dir, os.FileMode(0755)); err != nil {
 		return err
 	}
 
-	param := "latest"
-	if uuid != "" {
-		param = uuid
+	if err := metadata.Write(dir); err != nil {
+		return err
 	}
-	url := fmt.Sprintf("%s/solutions/%s", usrCfg.GetString("apibaseurl"), param)
 
 	client, err := api.NewClient(usrCfg.GetString("token"), usrCfg.GetString("apibaseurl"))
 	if err != nil {
 		return err
 	}
 
-	req, err := client.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-
-	if uuid == "" {
-		q := req.URL.Query()
-		q.Add("exercise_id", slug)
-		if track != "" {
-			q.Add("track_id", track)
-		}
-		if team != "" {
-			q.Add("team_id", team)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-
-	var payload downloadPayload
-	defer res.Body.Close()
-	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
-		return fmt.Errorf("unable to parse API response - %s", err)
-	}
-
-	if res.StatusCode == http.StatusUnauthorized {
-		siteURL := config.InferSiteURL(usrCfg.GetString("apibaseurl"))
-		return fmt.Errorf("unauthorized request. Please run the configure command. You can find your API token at %s/my/settings", siteURL)
-	}
-
-	if res.StatusCode != http.StatusOK {
-		switch payload.Error.Type {
-		case "track_ambiguous":
-			return fmt.Errorf("%s: %s", payload.Error.Message, strings.Join(payload.Error.PossibleTrackIDs, ", "))
-		default:
-			return errors.New(payload.Error.Message)
-		}
-	}
-
-	metadata := workspace.ExerciseMetadata{
-		AutoApprove: payload.Solution.Exercise.AutoApprove,
-		Track:       payload.Solution.Exercise.Track.ID,
-		Team:        payload.Solution.Team.Slug,
-		Exercise:    payload.Solution.Exercise.ID,
-		ID:          payload.Solution.ID,
-		URL:         payload.Solution.URL,
-		Handle:      payload.Solution.User.Handle,
-		IsRequester: payload.Solution.User.IsRequester,
-	}
-
-	root := usrCfg.GetString("workspace")
-	if metadata.Team != "" {
-		root = filepath.Join(root, "teams", metadata.Team)
-	}
-	if !metadata.IsRequester {
-		root = filepath.Join(root, "users", metadata.Handle)
-	}
-
-	exercise := workspace.Exercise{
-		Root:  root,
-		Track: metadata.Track,
-		Slug:  metadata.Exercise,
-	}
-
-	dir := exercise.MetadataDir()
-
-	if err := os.MkdirAll(dir, os.FileMode(0755)); err != nil {
-		return err
-	}
-
-	err = metadata.Write(dir)
-	if err != nil {
-		return err
-	}
-
-	for _, file := range payload.Solution.Files {
-		unparsedURL := fmt.Sprintf("%s%s", payload.Solution.FileDownloadBaseURL, file)
-		parsedURL, err := netURL.ParseRequestURI(unparsedURL)
-
+	for _, sf := range download.payload.files() {
+		url, err := sf.url()
 		if err != nil {
 			return err
 		}
-
-		url := parsedURL.String()
 
 		req, err := client.NewRequest("GET", url, nil)
 		if err != nil {
@@ -198,26 +101,12 @@ func runDownload(cfg config.Config, flags *pflag.FlagSet, args []string) error {
 			continue
 		}
 
-		// TODO: if there's a collision, interactively resolve (show diff, ask if overwrite).
-		// TODO: handle --force flag to overwrite without asking.
-
-		// Work around a path bug due to an early design decision (later reversed) to
-		// allow numeric suffixes for exercise directories, allowing people to have
-		// multiple parallel versions of an exercise.
-		pattern := fmt.Sprintf(`\A.*[/\\]%s-\d*/`, metadata.Exercise)
-		rgxNumericSuffix := regexp.MustCompile(pattern)
-		if rgxNumericSuffix.MatchString(file) {
-			file = string(rgxNumericSuffix.ReplaceAll([]byte(file), []byte("")))
-		}
-
-		// Rewrite paths submitted with an older, buggy client where the Windows path is being treated as part of the filename.
-		file = strings.Replace(file, "\\", "/", -1)
-
-		relativePath := filepath.FromSlash(file)
-		dir := filepath.Join(metadata.Dir, filepath.Dir(relativePath))
+		// TODO: handle collisions
+		path := sf.relativePath()
+		dir := filepath.Join(metadata.Dir, filepath.Dir(path))
 		os.MkdirAll(dir, os.FileMode(0755))
 
-		f, err := os.Create(filepath.Join(metadata.Dir, relativePath))
+		f, err := os.Create(filepath.Join(metadata.Dir, path))
 		if err != nil {
 			return err
 		}
@@ -229,6 +118,131 @@ func runDownload(cfg config.Config, flags *pflag.FlagSet, args []string) error {
 	}
 	fmt.Fprintf(Err, "\nDownloaded to\n")
 	fmt.Fprintf(Out, "%s\n", metadata.Dir)
+	return nil
+}
+
+type download struct {
+	// either/or
+	slug, uuid string
+
+	// user config
+	token, apibaseurl, workspace string
+
+	// optional
+	track, team string
+
+	payload *downloadPayload
+}
+
+func newDownload(flags *pflag.FlagSet, usrCfg *viper.Viper) (*download, error) {
+	var err error
+	d := &download{}
+	d.uuid, err = flags.GetString("uuid")
+	if err != nil {
+		return nil, err
+	}
+	d.slug, err = flags.GetString("exercise")
+	if err != nil {
+		return nil, err
+	}
+	d.track, err = flags.GetString("track")
+	if err != nil {
+		return nil, err
+	}
+	d.team, err = flags.GetString("team")
+	if err != nil {
+		return nil, err
+	}
+
+	d.token = usrCfg.GetString("token")
+	d.apibaseurl = usrCfg.GetString("apibaseurl")
+	d.workspace = usrCfg.GetString("workspace")
+
+	if err = d.needsSlugXorUUID(); err != nil {
+		return nil, err
+	}
+	if err = d.needsUserConfigValues(); err != nil {
+		return nil, err
+	}
+	if err = d.needsSlugWhenGivenTrackOrTeam(); err != nil {
+		return nil, err
+	}
+
+	client, err := api.NewClient(d.token, d.apibaseurl)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := client.NewRequest("GET", d.url(), nil)
+	if err != nil {
+		return nil, err
+	}
+	d.buildQueryParams(req.URL)
+
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if err := json.NewDecoder(res.Body).Decode(&d.payload); err != nil {
+		return nil, decodedAPIError(res)
+	}
+
+	return d, nil
+}
+
+func (d download) url() string {
+	id := "latest"
+	if d.uuid != "" {
+		id = d.uuid
+	}
+	return fmt.Sprintf("%s/solutions/%s", d.apibaseurl, id)
+}
+
+func (d download) buildQueryParams(url *netURL.URL) {
+	query := url.Query()
+	if d.slug != "" {
+		query.Add("exercise_id", d.slug)
+		if d.track != "" {
+			query.Add("track_id", d.track)
+		}
+		if d.team != "" {
+			query.Add("team_id", d.team)
+		}
+	}
+	url.RawQuery = query.Encode()
+}
+
+// needsSlugXorUUID checks the presence of slug XOR uuid.
+func (d download) needsSlugXorUUID() error {
+	if d.slug != "" && d.uuid != "" || d.uuid == d.slug {
+		return errors.New("need an --exercise name or a solution --uuid")
+	}
+	return nil
+}
+
+// needsUserConfigValues checks the presence of required values from the user config.
+func (d download) needsUserConfigValues() error {
+	errMsg := "missing required user config: '%s'"
+	if d.token == "" {
+		return fmt.Errorf(errMsg, "token")
+	}
+	if d.apibaseurl == "" {
+		return fmt.Errorf(errMsg, "apibaseurl")
+	}
+	if d.workspace == "" {
+		return fmt.Errorf(errMsg, "workspace")
+	}
+	return nil
+}
+
+// needsSlugWhenGivenTrackOrTeam ensures that track/team arguments are also given with a slug.
+// (track/team meaningless when given a uuid).
+func (d download) needsSlugWhenGivenTrackOrTeam() error {
+	if (d.team != "" || d.track != "") && d.slug == "" {
+		return errors.New("--track or --team requires --exercise (not --uuid)")
+	}
 	return nil
 }
 
@@ -264,6 +278,64 @@ type downloadPayload struct {
 		Message          string   `json:"message"`
 		PossibleTrackIDs []string `json:"possible_track_ids"`
 	} `json:"error,omitempty"`
+}
+
+func (dp downloadPayload) metadata() workspace.ExerciseMetadata {
+	return workspace.ExerciseMetadata{
+		AutoApprove:  dp.Solution.Exercise.AutoApprove,
+		Track:        dp.Solution.Exercise.Track.ID,
+		Team:         dp.Solution.Team.Slug,
+		ExerciseSlug: dp.Solution.Exercise.ID,
+		ID:           dp.Solution.ID,
+		URL:          dp.Solution.URL,
+		Handle:       dp.Solution.User.Handle,
+		IsRequester:  dp.Solution.User.IsRequester,
+	}
+}
+
+func (dp downloadPayload) files() []solutionFile {
+	fx := make([]solutionFile, 0, len(dp.Solution.Files))
+	for _, file := range dp.Solution.Files {
+		f := solutionFile{
+			path:    file,
+			baseURL: dp.Solution.FileDownloadBaseURL,
+			slug:    dp.Solution.Exercise.ID,
+		}
+		fx = append(fx, f)
+	}
+	return fx
+}
+
+type solutionFile struct {
+	path, baseURL, slug string
+}
+
+func (sf solutionFile) url() (string, error) {
+	url, err := netURL.ParseRequestURI(fmt.Sprintf("%s%s", sf.baseURL, sf.path))
+
+	if err != nil {
+		return "", err
+	}
+
+	return url.String(), nil
+}
+
+func (sf solutionFile) relativePath() string {
+	file := sf.path
+
+	// Work around a path bug due to an early design decision (later reversed) to
+	// allow numeric suffixes for exercise directories, letting people have
+	// multiple parallel versions of an exercise.
+	pattern := fmt.Sprintf(`\A.*[/\\]%s-\d*/`, sf.slug)
+	rgxNumericSuffix := regexp.MustCompile(pattern)
+	if rgxNumericSuffix.MatchString(sf.path) {
+		file = string(rgxNumericSuffix.ReplaceAll([]byte(sf.path), []byte("")))
+	}
+
+	// Rewrite paths submitted with an older, buggy client where the Windows path is being treated as part of the filename.
+	file = strings.Replace(file, "\\", "/", -1)
+
+	return filepath.FromSlash(file)
 }
 
 func setupDownloadFlags(flags *pflag.FlagSet) {

@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -23,8 +25,10 @@ func TestSubmitWithoutToken(t *testing.T) {
 	}
 
 	err := runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{})
-	assert.Regexp(t, "Welcome to Exercism", err.Error())
-	assert.Regexp(t, "exercism.io/my/settings", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "Welcome to Exercism", err.Error())
+		assert.Regexp(t, "exercism.io/my/settings", err.Error())
+	}
 }
 
 func TestSubmitWithoutWorkspace(t *testing.T) {
@@ -38,7 +42,9 @@ func TestSubmitWithoutWorkspace(t *testing.T) {
 	}
 
 	err := runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{})
-	assert.Regexp(t, "re-run the configure", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "re-run the configure", err.Error())
+	}
 }
 
 func TestSubmitNonExistentFile(t *testing.T) {
@@ -49,6 +55,7 @@ func TestSubmitNonExistentFile(t *testing.T) {
 	v := viper.New()
 	v.Set("token", "abc123")
 	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", "http://api.example.com")
 
 	cfg := config.Config{
 		Persister:       config.InMemoryPersister{},
@@ -67,7 +74,9 @@ func TestSubmitNonExistentFile(t *testing.T) {
 		filepath.Join(tmpDir, "file-2.txt"),
 	}
 	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), files)
-	assert.Regexp(t, "cannot be found", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "cannot be found", err.Error())
+	}
 }
 
 func TestSubmitExerciseWithoutMetadataFile(t *testing.T) {
@@ -85,6 +94,7 @@ func TestSubmitExerciseWithoutMetadataFile(t *testing.T) {
 	v := viper.New()
 	v.Set("token", "abc123")
 	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", "http://api.example.com")
 
 	cfg := config.Config{
 		Persister:       config.InMemoryPersister{},
@@ -93,8 +103,9 @@ func TestSubmitExerciseWithoutMetadataFile(t *testing.T) {
 	}
 
 	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file})
-	assert.Error(t, err)
-	assert.Regexp(t, "doesn't have the necessary metadata", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "doesn't have the necessary metadata", err.Error())
+	}
 }
 
 func TestSubmitFilesAndDir(t *testing.T) {
@@ -105,6 +116,7 @@ func TestSubmitFilesAndDir(t *testing.T) {
 	v := viper.New()
 	v.Set("token", "abc123")
 	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", "http://api.example.com")
 
 	cfg := config.Config{
 		Persister:       config.InMemoryPersister{},
@@ -122,20 +134,59 @@ func TestSubmitFilesAndDir(t *testing.T) {
 		tmpDir,
 		filepath.Join(tmpDir, "file-2.txt"),
 	}
+
 	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), files)
-	assert.Regexp(t, "submitting a directory", err.Error())
-	assert.Regexp(t, "Please change into the directory and provide the path to the file\\(s\\) you wish to submit", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "submitting a directory", err.Error())
+		assert.Regexp(t, "Please change into the directory and provide the path to the file\\(s\\) you wish to submit", err.Error())
+	}
+}
+
+func TestDuplicateFiles(t *testing.T) {
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
+	// The fake endpoint will populate this when it receives the call from the command.
+	submittedFiles := map[string]string{}
+	ts := fakeSubmitServer(t, submittedFiles)
+	defer ts.Close()
+
+	tmpDir, err := ioutil.TempDir("", "duplicate-files")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	dir := filepath.Join(tmpDir, "bogus-track", "bogus-exercise")
+	os.MkdirAll(dir, os.FileMode(0755))
+
+	writeFakeMetadata(t, dir, "bogus-track", "bogus-exercise")
+
+	v := viper.New()
+	v.Set("token", "abc123")
+	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", ts.URL)
+
+	cfg := config.Config{
+		Persister:       config.InMemoryPersister{},
+		UserViperConfig: v,
+	}
+
+	file1 := filepath.Join(dir, "file-1.txt")
+	err = ioutil.WriteFile(file1, []byte("This is file 1."), os.FileMode(0755))
+
+	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file1, file1})
+	assert.NoError(t, err)
+
+	assert.Equal(t, 1, len(submittedFiles))
+	assert.Equal(t, "This is file 1.", submittedFiles["file-1.txt"])
 }
 
 func TestSubmitFiles(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+	Err = &bytes.Buffer{}
+
 	// The fake endpoint will populate this when it receives the call from the command.
 	submittedFiles := map[string]string{}
 	ts := fakeSubmitServer(t, submittedFiles)
@@ -176,26 +227,24 @@ func TestSubmitFiles(t *testing.T) {
 	files := []string{
 		file1, file2, readme,
 	}
+
 	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), files)
-	assert.NoError(t, err)
 
-	assert.Equal(t, 3, len(submittedFiles))
-
-	assert.Equal(t, "This is file 1.", submittedFiles["file-1.txt"])
-	assert.Equal(t, "This is file 2.", submittedFiles["subdir/file-2.txt"])
-	assert.Equal(t, "This is the readme.", submittedFiles["README.md"])
+	if assert.NoError(t, err) {
+		assert.Equal(t, 3, len(submittedFiles))
+		assert.Equal(t, "This is file 1.", submittedFiles["file-1.txt"])
+		assert.Equal(t, "This is file 2.", submittedFiles["subdir/file-2.txt"])
+		assert.Equal(t, "This is the readme.", submittedFiles["README.md"])
+		assert.Regexp(t, "submitted successfully", Err)
+	}
 }
 
 func TestLegacyMetadataMigration(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
-	// The fake endpoint will populate this when it receives the call from the command.
+	co := newCapturedOutput()
+	co.newErr = &bytes.Buffer{}
+	co.override()
+	defer co.reset()
+
 	submittedFiles := map[string]string{}
 	ts := fakeSubmitServer(t, submittedFiles)
 	defer ts.Close()
@@ -208,11 +257,11 @@ func TestLegacyMetadataMigration(t *testing.T) {
 	os.MkdirAll(dir, os.FileMode(0755))
 
 	metadata := &workspace.ExerciseMetadata{
-		ID:          "bogus-solution-uuid",
-		Track:       "bogus-track",
-		Exercise:    "bogus-exercise",
-		URL:         "http://example.com/bogus-url",
-		IsRequester: true,
+		ID:           "bogus-solution-uuid",
+		Track:        "bogus-track",
+		ExerciseSlug: "bogus-exercise",
+		URL:          "http://example.com/bogus-url",
+		IsRequester:  true,
 	}
 	b, err := json.Marshal(metadata)
 	assert.NoError(t, err)
@@ -239,7 +288,10 @@ func TestLegacyMetadataMigration(t *testing.T) {
 	ok, _ = exercise.HasMetadata()
 	assert.False(t, ok)
 
-	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file})
+	flags := pflag.NewFlagSet("fake", pflag.PanicOnError)
+	flags.Bool("verbose", true, "")
+
+	err = runSubmit(cfg, flags, []string{file})
 	assert.NoError(t, err)
 	assert.Equal(t, "This is a file.", submittedFiles["file.txt"])
 
@@ -247,17 +299,13 @@ func TestLegacyMetadataMigration(t *testing.T) {
 	assert.False(t, ok)
 	ok, _ = exercise.HasMetadata()
 	assert.True(t, ok)
+	assert.Regexp(t, "Migrated metadata", Err)
 }
 
 func TestSubmitWithEmptyFile(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
 
 	// The fake endpoint will populate this when it receives the call from the command.
 	submittedFiles := map[string]string{}
@@ -296,14 +344,9 @@ func TestSubmitWithEmptyFile(t *testing.T) {
 }
 
 func TestSubmitWithEnormousFile(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
 
 	// The fake endpoint will populate this when it receives the call from the command.
 	submittedFiles := map[string]string{}
@@ -337,19 +380,16 @@ func TestSubmitWithEnormousFile(t *testing.T) {
 
 	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file})
 
-	assert.Error(t, err)
-	assert.Regexp(t, "Please reduce the size of the file and try again.", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "Please reduce the size of the file and try again.", err.Error())
+	}
 }
 
 func TestSubmitFilesForTeamExercise(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
 	// The fake endpoint will populate this when it receives the call from the command.
 	submittedFiles := map[string]string{}
 	ts := fakeSubmitServer(t, submittedFiles)
@@ -393,14 +433,9 @@ func TestSubmitFilesForTeamExercise(t *testing.T) {
 }
 
 func TestSubmitOnlyEmptyFile(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
 
 	tmpDir, err := ioutil.TempDir("", "just-an-empty-file")
 	defer os.RemoveAll(tmpDir)
@@ -414,6 +449,7 @@ func TestSubmitOnlyEmptyFile(t *testing.T) {
 	v := viper.New()
 	v.Set("token", "abc123")
 	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", "http://api.example.com")
 
 	cfg := config.Config{
 		Persister:       config.InMemoryPersister{},
@@ -424,8 +460,9 @@ func TestSubmitOnlyEmptyFile(t *testing.T) {
 	err = ioutil.WriteFile(file, []byte(""), os.FileMode(0755))
 
 	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file})
-	assert.Error(t, err)
-	assert.Regexp(t, "No files found", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "No files found", err.Error())
+	}
 }
 
 func TestSubmitFilesFromDifferentSolutions(t *testing.T) {
@@ -452,6 +489,7 @@ func TestSubmitFilesFromDifferentSolutions(t *testing.T) {
 	v := viper.New()
 	v.Set("token", "abc123")
 	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", "http://api.example.com")
 
 	cfg := config.Config{
 		Persister:       config.InMemoryPersister{},
@@ -460,8 +498,9 @@ func TestSubmitFilesFromDifferentSolutions(t *testing.T) {
 	}
 
 	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file1, file2})
-	assert.Error(t, err)
-	assert.Regexp(t, "different solutions", err.Error())
+	if assert.Error(t, err) {
+		assert.Regexp(t, "different solutions", err.Error())
+	}
 }
 
 func fakeSubmitServer(t *testing.T, submittedFiles map[string]string) *httptest.Server {
@@ -485,19 +524,17 @@ func fakeSubmitServer(t *testing.T, submittedFiles map[string]string) *httptest.
 			}
 			submittedFiles[fileHeader.Filename] = string(body)
 		}
+
+		fmt.Fprint(w, "{}")
 	})
 	return httptest.NewServer(handler)
 }
 
 func TestSubmitRelativePath(t *testing.T) {
-	oldOut := Out
-	oldErr := Err
-	Out = ioutil.Discard
-	Err = ioutil.Discard
-	defer func() {
-		Out = oldOut
-		Err = oldErr
-	}()
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
 	// The fake endpoint will populate this when it receives the call from the command.
 	submittedFiles := map[string]string{}
 	ts := fakeSubmitServer(t, submittedFiles)
@@ -534,13 +571,168 @@ func TestSubmitRelativePath(t *testing.T) {
 	assert.Equal(t, "This is a file.", submittedFiles["file.txt"])
 }
 
+func TestSubmitServerErr(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"error": {"type": "error", "message": "test error"}}`)
+	})
+
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	tmpDir, err := ioutil.TempDir("", "submit-err-tmp-dir")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	v := viper.New()
+	v.Set("token", "abc123")
+	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", ts.URL)
+
+	cfg := config.Config{
+		Persister:       config.InMemoryPersister{},
+		UserViperConfig: v,
+		DefaultBaseURL:  "http://example.com",
+	}
+
+	dir := filepath.Join(tmpDir, "bogus-track", "bogus-exercise")
+	os.MkdirAll(filepath.Join(dir, "subdir"), os.FileMode(0755))
+	writeFakeMetadata(t, dir, "bogus-track", "bogus-exercise")
+
+	err = ioutil.WriteFile(filepath.Join(dir, "file-1.txt"), []byte("This is file 1"), os.FileMode(0755))
+	assert.NoError(t, err)
+
+	files := []string{
+		filepath.Join(dir, "file-1.txt"),
+	}
+
+	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), files)
+
+	assert.Regexp(t, "test error", err.Error())
+}
+
+func TestHandleErrorResponse(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+	})
+
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	tmpDir, err := ioutil.TempDir("", "submit-nonsuccess")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	v := viper.New()
+	v.Set("token", "abc123")
+	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", ts.URL)
+
+	cfg := config.Config{
+		Persister:       config.InMemoryPersister{},
+		UserViperConfig: v,
+		DefaultBaseURL:  "http://example.com",
+	}
+
+	dir := filepath.Join(tmpDir, "bogus-track", "bogus-exercise")
+	os.MkdirAll(filepath.Join(dir, "subdir"), os.FileMode(0755))
+	writeFakeMetadata(t, dir, "bogus-track", "bogus-exercise")
+
+	err = ioutil.WriteFile(filepath.Join(dir, "file-1.txt"), []byte("This is file 1"), os.FileMode(0755))
+	assert.NoError(t, err)
+
+	files := []string{
+		filepath.Join(dir, "file-1.txt"),
+	}
+
+	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), files)
+	assert.Error(t, err)
+}
+
+func TestSubmissionNotConnectedToRequesterAccount(t *testing.T) {
+	submittedFiles := map[string]string{}
+	ts := fakeSubmitServer(t, submittedFiles)
+	defer ts.Close()
+
+	tmpDir, err := ioutil.TempDir("", "submit-files")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	dir := filepath.Join(tmpDir, "bogus-track", "bogus-exercise")
+	os.MkdirAll(filepath.Join(dir, "subdir"), os.FileMode(0755))
+
+	metadata := &workspace.ExerciseMetadata{
+		ID:           "bogus-solution-uuid",
+		Track:        "bogus-track",
+		ExerciseSlug: "bogus-exercise",
+		URL:          "http://example.com/bogus-url",
+		IsRequester:  false,
+	}
+	err = metadata.Write(dir)
+	assert.NoError(t, err)
+
+	file1 := filepath.Join(dir, "file-1.txt")
+	err = ioutil.WriteFile(file1, []byte("This is file 1."), os.FileMode(0755))
+	assert.NoError(t, err)
+
+	v := viper.New()
+	v.Set("token", "abc123")
+	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", ts.URL)
+
+	cfg := config.Config{
+		Persister:       config.InMemoryPersister{},
+		Dir:             tmpDir,
+		UserViperConfig: v,
+	}
+
+	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file1})
+	if assert.Error(t, err) {
+		assert.Regexp(t, "not connected to your account", err.Error())
+	}
+}
+
+func TestExerciseDirnameMatchesMetadataSlug(t *testing.T) {
+	submittedFiles := map[string]string{}
+	ts := fakeSubmitServer(t, submittedFiles)
+	defer ts.Close()
+
+	tmpDir, err := ioutil.TempDir("", "submit-files")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	dir := filepath.Join(tmpDir, "bogus-track", "bogus-exercise-doesnt-match-metadata-slug")
+	os.MkdirAll(filepath.Join(dir, "subdir"), os.FileMode(0755))
+	writeFakeMetadata(t, dir, "bogus-track", "bogus-exercise")
+
+	file1 := filepath.Join(dir, "file-1.txt")
+	err = ioutil.WriteFile(file1, []byte("This is file 1."), os.FileMode(0755))
+	assert.NoError(t, err)
+
+	v := viper.New()
+	v.Set("token", "abc123")
+	v.Set("workspace", tmpDir)
+	v.Set("apibaseurl", ts.URL)
+
+	cfg := config.Config{
+		Persister:       config.InMemoryPersister{},
+		Dir:             tmpDir,
+		UserViperConfig: v,
+	}
+
+	err = runSubmit(cfg, pflag.NewFlagSet("fake", pflag.PanicOnError), []string{file1})
+	if assert.Error(t, err) {
+		assert.Regexp(t, "directory does not match exercise slug", err.Error())
+	}
+}
+
 func writeFakeMetadata(t *testing.T, dir, trackID, exerciseSlug string) {
 	metadata := &workspace.ExerciseMetadata{
-		ID:          "bogus-solution-uuid",
-		Track:       trackID,
-		Exercise:    exerciseSlug,
-		URL:         "http://example.com/bogus-url",
-		IsRequester: true,
+		ID:           "bogus-solution-uuid",
+		Track:        trackID,
+		ExerciseSlug: exerciseSlug,
+		URL:          "http://example.com/bogus-url",
+		IsRequester:  true,
 	}
 	err := metadata.Write(dir)
 	assert.NoError(t, err)
